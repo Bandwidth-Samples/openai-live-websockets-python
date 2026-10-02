@@ -186,22 +186,20 @@ async def initialize_openai_session(connection: AsyncLiveConnection):
     await connection.response.create()
 
 
-async def receive_from_bandwidth_ws(bandwidth_websocket: WebSocket, connection: AsyncLiveConnection):
+async def receive_from_bandwidth_ws(bandwidth_websocket: WebSocket, connection: AsyncLiveConnection, call_id: str):
     """
     Receive messages from Bandwidth WebSocket and forward audio to OpenAI Live.
     :param bandwidth_websocket: The Bandwidth WebSocket connection
     :param connection: The OpenAI Live connection
+    :param call_id: The Bandwidth call ID, from the stream's start event
     :return: None
     """
-    bw_call_id: str | None = None
+    call_start_times[call_id] = datetime.now()
+    _print_call_start(call_id)
     try:
         async for message in bandwidth_websocket.iter_json():
             event = BandwidthStreamEvent.model_validate(message)
             match event.event_type:
-                case StreamEventType.STREAM_STARTED:
-                    bw_call_id = event.metadata.call_id
-                    call_start_times[bw_call_id] = datetime.now()
-                    _print_call_start(bw_call_id)
                 case StreamEventType.MEDIA:
                     await connection.session.input_audio.append(audio=event.payload)
                 case StreamEventType.STREAM_STOPPED:
@@ -211,8 +209,7 @@ async def receive_from_bandwidth_ws(bandwidth_websocket: WebSocket, connection: 
     except Exception:
         pass
     finally:
-        _cid = bw_call_id or ""
-        _print_call_end(_cid)
+        _print_call_end(call_id)
         try:
             await bandwidth_websocket.close()
         except Exception:
@@ -363,7 +360,7 @@ def handle_initiate_event(callback: InitiateCallback) -> Response:
 
     websocket_url = f"wss://{BASE_URL.replace('https://', '').replace('http://', '')}/ws"
     start_stream = StartStream(
-        destination=f"{websocket_url}?call_id={call_id}",
+        destination=websocket_url,
         mode="bidirectional",
         name=call_id,
         destination_username="foo",
@@ -376,18 +373,27 @@ def handle_initiate_event(callback: InitiateCallback) -> Response:
 
 
 @app.websocket("/ws")
-async def handle_inbound_websocket(bandwidth_websocket: WebSocket, call_id: str = None):
+async def handle_inbound_websocket(bandwidth_websocket: WebSocket):
     """
     Handle inbound WebSocket connections from Bandwidth and bridge to OpenAI Live.
+    The call ID comes from the stream's first message, the start event, so any
+    <StartStream> pointed at /ws works — not only the one this app's initiate
+    webhook returns.
     :param bandwidth_websocket: The incoming WebSocket connection from Bandwidth
-    :param call_id: The Bandwidth call ID passed as a query parameter
     :return: None
     """
     await bandwidth_websocket.accept()
 
+    try:
+        start = BandwidthStreamEvent.model_validate(await bandwidth_websocket.receive_json())
+    except Exception as e:
+        logger.error(f"Could not read the stream's start event: {e}")
+        await bandwidth_websocket.close(code=1008, reason="Expected a start event")
+        return
+    call_id = start.metadata.call_id if start.event_type == StreamEventType.STREAM_STARTED and start.metadata else None
     if not call_id:
-        logger.error("No call_id provided in WebSocket connection")
-        await bandwidth_websocket.close(code=1008, reason="Missing call_id parameter")
+        logger.error("First stream message was not a start event with a callId")
+        await bandwidth_websocket.close(code=1008, reason="Expected a start event with a callId")
         return
 
     try:
@@ -396,7 +402,7 @@ async def handle_inbound_websocket(bandwidth_websocket: WebSocket, call_id: str 
             call_sessions[call_id] = connection
             try:
                 await initialize_openai_session(connection)
-                bw_task = asyncio.create_task(receive_from_bandwidth_ws(bandwidth_websocket, connection))
+                bw_task = asyncio.create_task(receive_from_bandwidth_ws(bandwidth_websocket, connection, call_id))
                 oai_task = asyncio.create_task(receive_from_openai_ws(connection, bandwidth_websocket, call_id))
                 done, pending = await asyncio.wait(
                     [bw_task, oai_task], return_when=asyncio.FIRST_COMPLETED
