@@ -12,6 +12,7 @@
 * [Running the Application](#running-the-application)
 * [Callback URLs](#callback-urls)
   * [Ngrok](#ngrok)
+* [Outbound Calls](#outbound-calls)
 
 ## Description
 
@@ -33,6 +34,8 @@ The sample app uses the below environmental variables.
 BW_ACCOUNT_ID      # Your Bandwidth Account ID
 BW_CLIENT_ID       # Your Bandwidth OAuth 2.0 Client ID
 BW_CLIENT_SECRET   # Your Bandwidth OAuth 2.0 Client Secret
+BW_NUMBER          # A Bandwidth number on your account, the from number for outbound calls (E.164)
+BW_VOICE_APPLICATION_ID # The Voice Application ID associated with BW_NUMBER
 OPENAI_API_KEY     # Your OpenAI API Key (must have access to the Live API)
 TRANSFER_TO        # The phone number to transfer calls to (E.164 format, e.g. +19195554321)
 BASE_URL           # The base URL for your application (e.g. https://myapp.ngrok.io)
@@ -67,7 +70,8 @@ For a detailed introduction, check out our [Bandwidth Voice Webhooks](https://de
 Below are the callback paths exposed by this application:
 
 * `/health`
-* `/webhooks/bandwidth/voice/initiate`
+* `/webhooks/bandwidth/voice/initiate` — inbound call
+* `/webhooks/bandwidth/voice/answer` — outbound call answered
 * `/webhooks/bandwidth/voice/status`
 * `/webhooks/bandwidth/voice/hold` — place or remove a hold (`POST {"call_id": "...", "hold": true|false}`)
 
@@ -82,3 +86,13 @@ ngrok http $LOCAL_PORT
 ```
 
 You can view your public URL at `http://127.0.0.1:4040` after ngrok is running.  You can also view the status of the tunnel and requests/responses here.
+
+## Outbound Calls
+
+To have the AI agent place a call, POST the number to `/calls`. When the callee answers, Bandwidth sends the answer webhook and the call is bridged to the agent, the same as an inbound call.
+
+```sh
+curl -X POST http://localhost:3000/calls \
+  -H "Content-Type: application/json" \
+  -d '{"to": "+19195551234"}'
+```

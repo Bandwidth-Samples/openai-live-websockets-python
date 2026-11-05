@@ -15,7 +15,7 @@ from openai import AsyncOpenAI
 from openai.resources.live.live import AsyncLiveConnection
 
 from bandwidth import Configuration, ApiClient, CallsApi
-from bandwidth.models import InitiateCallback, DisconnectCallback
+from bandwidth.models import AnswerCallback, CreateCall, InitiateCallback, DisconnectCallback
 from bandwidth.models.bxml import PhoneNumber, StartStream, StopStream, Transfer, Bxml
 from pydantic import BaseModel
 from rich import inspect
@@ -35,6 +35,8 @@ try:
     BW_CLIENT_ID = os.environ["BW_CLIENT_ID"]
     BW_CLIENT_SECRET = os.environ["BW_CLIENT_SECRET"]
     OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+    BW_NUMBER = os.environ["BW_NUMBER"]
+    BW_VOICE_APPLICATION_ID = os.environ["BW_VOICE_APPLICATION_ID"]
     TRANSFER_TO = os.environ["TRANSFER_TO"]
     BASE_URL = os.environ["BASE_URL"]
     LOG_LEVEL = os.environ["LOG_LEVEL"].upper()
@@ -43,7 +45,7 @@ except KeyError as e:
     msg = Text(" Missing environment variables! ", style="bold white on red")
     details = f"Required key not set: [yellow]{e.args[0]}[/yellow]\n\n"
     details += "Make sure the following variables are defined:\n"
-    details += "[cyan]BW_ACCOUNT_ID, BW_CLIENT_ID, BW_CLIENT_SECRET, OPENAI_API_KEY, TRANSFER_TO, BASE_URL, LOG_LEVEL, LOCAL_PORT[/cyan]"
+    details += "[cyan]BW_ACCOUNT_ID, BW_CLIENT_ID, BW_CLIENT_SECRET, BW_NUMBER, BW_VOICE_APPLICATION_ID, OPENAI_API_KEY, TRANSFER_TO, BASE_URL, LOG_LEVEL, LOCAL_PORT[/cyan]"
     console.print(Panel(details, title=msg, expand=False, border_style="red"))
     sys.exit(1)
 
@@ -114,7 +116,7 @@ def _print_call_start(call_id: str) -> None:
     now = datetime.now().strftime("%H:%M:%S")
     console.print(Panel(
         f"[bold white]{call_id}[/bold white]   [dim]{now}[/dim]",
-        title="[bold blue] Inbound Call [/bold blue]",
+        title="[bold blue] Call [/bold blue]",
         border_style="blue",
     ))
 
@@ -139,6 +141,12 @@ class HoldRequest(BaseModel):
 
     call_id: str
     hold: bool
+
+
+class OutboundCallRequest(BaseModel):
+    """Request body for the outbound call endpoint."""
+
+    to: str
 
 
 def log_inspect(obj, label=None):
@@ -346,18 +354,14 @@ def health():
     return
 
 
-@app.post("/webhooks/bandwidth/voice/initiate", status_code=http.HTTPStatus.OK)
-def handle_initiate_event(callback: InitiateCallback) -> Response:
+def _stream_bxml(call_id: str) -> Response:
     """
-    Handle the initiate event from Bandwidth.
-    Responds with BXML to start a bidirectional audio stream to our WebSocket server.
+    Build the BXML response that bridges a call to the /ws WebSocket, and so to the AI agent.
+    Shared by the inbound (initiate) and outbound (answer) webhooks.
 
-    :param callback: The initiate callback data
-    :return: BXML response with StartStream verb
+    :param call_id: The Bandwidth call ID, used to name the stream
+    :return: BXML response with StartStream and StopStream verbs
     """
-    call_id = callback.call_id
-    logger.info(f"Received initiate event for call ID: {call_id}")
-
     websocket_url = f"wss://{BASE_URL.replace('https://', '').replace('http://', '')}/ws"
     start_stream = StartStream(
         destination=websocket_url,
@@ -370,6 +374,57 @@ def handle_initiate_event(callback: InitiateCallback) -> Response:
     bxml_response = Bxml(nested_verbs=[start_stream, stop_stream])
 
     return Response(status_code=http.HTTPStatus.OK, content=bxml_response.to_bxml(), media_type="application/xml")
+
+
+@app.post("/webhooks/bandwidth/voice/initiate", status_code=http.HTTPStatus.OK)
+def handle_initiate_event(callback: InitiateCallback) -> Response:
+    """
+    Handle the initiate event from Bandwidth for an inbound call.
+    Responds with BXML to start a bidirectional audio stream to our WebSocket server.
+
+    :param callback: The initiate callback data
+    :return: BXML response with StartStream verb
+    """
+    logger.info(f"Received initiate event for call ID: {callback.call_id}")
+    return _stream_bxml(callback.call_id)
+
+
+@app.post("/calls", status_code=http.HTTPStatus.CREATED)
+def create_outbound_call(request: OutboundCallRequest) -> dict[str, str]:
+    """
+    Place an outbound call. When the callee answers, Bandwidth sends the answer
+    webhook, which bridges the call to the AI agent.
+
+    :param request: OutboundCallRequest containing the number to call
+    :return: The new call's ID
+    """
+    create_call = CreateCall(
+        to=request.to,
+        var_from=BW_NUMBER,
+        application_id=BW_VOICE_APPLICATION_ID,
+        answer_url=f"{BASE_URL}/webhooks/bandwidth/voice/answer",
+        disconnect_url=f"{BASE_URL}/webhooks/bandwidth/voice/status",
+    )
+    try:
+        call = bandwidth_voice_api_instance.create_call(BW_ACCOUNT, create_call)
+    except Exception as e:
+        logger.error(f"Error creating outbound call to {request.to}: {e}")
+        raise HTTPException(status_code=http.HTTPStatus.BAD_GATEWAY, detail=f"Bandwidth create call failed: {e}")
+    logger.info(f"Created outbound call {call.call_id} to {request.to}")
+    return {"call_id": call.call_id}
+
+
+@app.post("/webhooks/bandwidth/voice/answer", status_code=http.HTTPStatus.OK)
+def handle_answer_event(callback: AnswerCallback) -> Response:
+    """
+    Handle the answer event from Bandwidth for an outbound call.
+    Responds with the same BXML as an inbound call, bridging the callee to the AI agent.
+
+    :param callback: The answer callback data
+    :return: BXML response with StartStream verb
+    """
+    logger.info(f"Received answer event for call ID: {callback.call_id}")
+    return _stream_bxml(callback.call_id)
 
 
 @app.websocket("/ws")
